@@ -1,0 +1,13 @@
+[package]
+name = "sui_validator_rtt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+sui-sdk = { git = "https://github.com/MystenLabs/sui", package = "sui-sdk" }
