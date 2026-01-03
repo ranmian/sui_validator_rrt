@@ -1,21 +1,21 @@
 //! Sui Validator RTT Probe - Industrial Grade
 //!
-//! Measures RTT to Sui validators using multiple protocols.
+//! Measures RTT to Sui validators using TCP connection timing.
+//! QUIC/Anemo requires mutual TLS with validator certificates,
+//! so we use TCP handshake RTT as a reliable proxy for network latency.
+//!
 //! Features:
-//! - QUIC protocol probe (Anemo P2P layer)
-//! - TCP fallback for validators that don't accept QUIC
+//! - TCP handshake RTT measurement (reliable, no cert issues)
 //! - Concurrency control with semaphore
 //! - Stake-weighted ranking and scoring
 //! - DNS resolution support
-//! - Retry logic with exponential backoff
+//! - Retry logic
 
 use anyhow::Result;
 use futures::future::join_all;
-use quinn::{ClientConfig, Endpoint, TransportConfig};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -35,110 +35,19 @@ const DEFAULT_PORT: u16 = 8084;
 const RTT_PROBES: usize = 5;
 
 /// Timeout for each probe attempt (ms)
-const RTT_TIMEOUT_MS: u64 = 5000;
+const RTT_TIMEOUT_MS: u64 = 3000;
 
 /// Maximum concurrent connections
-const MAX_CONCURRENT_PROBES: usize = 50;
+const MAX_CONCURRENT_PROBES: usize = 100;
 
 /// Delay between probes to same validator (ms)
-const PROBE_INTERVAL_MS: u64 = 100;
+const PROBE_INTERVAL_MS: u64 = 50;
 
 /// Number of top validators to display
 const TOP_N_VALIDATORS: usize = 30;
 
-/// QUIC idle timeout (ms)
-const QUIC_IDLE_TIMEOUT_MS: u64 = 10000;
-
-/// Enable debug output
-const DEBUG: bool = true;
-
-/* ================== QUIC Client Setup ================== */
-
-/// Custom certificate verifier that accepts any certificate.
-/// Required for probing validators without their CA chain.
-/// WARNING: Only for RTT measurement, not secure communication.
-#[derive(Debug)]
-struct InsecureCertVerifier(Arc<rustls::crypto::CryptoProvider>);
-
-impl InsecureCertVerifier {
-    fn new() -> Arc<Self> {
-        Arc::new(Self(Arc::new(rustls::crypto::ring::default_provider())))
-    }
-}
-
-impl rustls::client::danger::ServerCertVerifier for InsecureCertVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp: &[u8],
-        _now: UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-/// Create a QUIC endpoint configured for RTT probing
-fn create_quic_endpoint() -> Result<Endpoint> {
-    // Build rustls config with insecure verifier
-    let crypto_config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(InsecureCertVerifier::new())
-        .with_no_client_auth();
-
-    // Convert to Quinn crypto config
-    let quic_crypto: quinn::crypto::rustls::QuicClientConfig = crypto_config.try_into()?;
-
-    // Configure transport for fast probing
-    let mut transport = TransportConfig::default();
-    transport.max_idle_timeout(Some(Duration::from_millis(QUIC_IDLE_TIMEOUT_MS).try_into()?));
-    transport.keep_alive_interval(None); // Disable keep-alive for probing
-
-    let mut client_config = ClientConfig::new(Arc::new(quic_crypto));
-    client_config.transport_config(Arc::new(transport));
-
-    // Bind to ephemeral port
-    let mut endpoint = Endpoint::client(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        0,
-    ))?;
-    endpoint.set_default_client_config(client_config);
-
-    Ok(endpoint)
-}
+/// Minimum successful probes required
+const MIN_SUCCESSFUL_PROBES: usize = 2;
 
 /* ================== Multiaddr Parsing ================== */
 
@@ -229,14 +138,7 @@ fn infer_region(name: &str, domain: &str) -> &'static str {
 
 /* ================== RTT Measurement ================== */
 
-/// Probe result with protocol info
-#[derive(Debug, Clone)]
-enum ProbeProtocol {
-    Quic,
-    Tcp,
-}
-
-/// Measure TCP handshake RTT
+/// Measure TCP handshake RTT (SYN -> SYN-ACK timing)
 async fn probe_tcp_rtt(addr: SocketAddr) -> Option<u128> {
     let start = Instant::now();
     match timeout(Duration::from_millis(RTT_TIMEOUT_MS), TcpStream::connect(addr)).await {
@@ -245,112 +147,34 @@ async fn probe_tcp_rtt(addr: SocketAddr) -> Option<u128> {
     }
 }
 
-/// Measure QUIC handshake RTT to a target address
-async fn probe_quic_rtt(
-    endpoint: &Endpoint,
-    addr: SocketAddr,
-    server_name: &str,
-) -> Option<u128> {
-    let start = Instant::now();
-
-    let connecting = match endpoint.connect(addr, server_name) {
-        Ok(c) => c,
-        Err(e) => {
-            if DEBUG {
-                eprintln!("  QUIC connect error: {:?}", e);
-            }
-            return None;
-        }
-    };
-
-    match timeout(Duration::from_millis(RTT_TIMEOUT_MS), connecting).await {
-        Ok(Ok(conn)) => {
-            let rtt = start.elapsed().as_millis();
-            conn.close(0u32.into(), b"probe");
-            Some(rtt)
-        }
-        Ok(Err(e)) => {
-            if DEBUG {
-                eprintln!("  QUIC handshake error: {:?}", e);
-            }
-            None
-        }
-        Err(_) => {
-            if DEBUG {
-                eprintln!("  QUIC timeout");
-            }
-            None
-        }
-    }
-}
-
-/// Measure RTT with multiple probes, trying QUIC first then TCP
+/// Measure RTT with multiple TCP probes
 async fn measure_validator_rtt(
     host: String,
     port: u16,
     semaphore: Arc<Semaphore>,
-) -> Option<(u128, u128, u128, IpAddr, ProbeProtocol)> {
+) -> Option<(u128, u128, u128, IpAddr)> {
     // Acquire semaphore permit for concurrency control
     let _permit = semaphore.acquire().await.ok()?;
 
     // Resolve DNS
     let addr_str = format!("{}:{}", host, port);
-    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host(&addr_str).await {
-        Ok(a) => a.collect(),
-        Err(e) => {
-            if DEBUG {
-                eprintln!("DNS resolution failed for {}: {:?}", addr_str, e);
-            }
-            return None;
-        }
-    };
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&addr_str).await.ok()?.collect();
     let addr = *addrs.first()?;
     let resolved_ip = addr.ip();
 
-    // Try QUIC first
-    let endpoint = create_quic_endpoint().ok();
     let mut samples: Vec<u128> = Vec::with_capacity(RTT_PROBES);
-    let mut protocol = ProbeProtocol::Quic;
-    let mut quic_failed = false;
 
-    if let Some(ref ep) = endpoint {
-        // First probe to test if QUIC works
-        if let Some(rtt) = probe_quic_rtt(ep, addr, "localhost").await {
+    for probe_idx in 0..RTT_PROBES {
+        if probe_idx > 0 {
+            tokio::time::sleep(Duration::from_millis(PROBE_INTERVAL_MS)).await;
+        }
+        if let Some(rtt) = probe_tcp_rtt(addr).await {
             samples.push(rtt);
-        } else {
-            quic_failed = true;
-        }
-    } else {
-        quic_failed = true;
-    }
-
-    // If QUIC failed, fall back to TCP
-    if quic_failed {
-        protocol = ProbeProtocol::Tcp;
-        samples.clear();
-
-        for probe_idx in 0..RTT_PROBES {
-            if probe_idx > 0 {
-                tokio::time::sleep(Duration::from_millis(PROBE_INTERVAL_MS)).await;
-            }
-            if let Some(rtt) = probe_tcp_rtt(addr).await {
-                samples.push(rtt);
-            }
-        }
-    } else {
-        // Continue QUIC probes
-        if let Some(ref ep) = endpoint {
-            for probe_idx in 1..RTT_PROBES {
-                tokio::time::sleep(Duration::from_millis(PROBE_INTERVAL_MS)).await;
-                if let Some(rtt) = probe_quic_rtt(ep, addr, "localhost").await {
-                    samples.push(rtt);
-                }
-            }
         }
     }
 
-    // Need at least 1 sample
-    if samples.is_empty() {
+    // Need minimum samples for statistics
+    if samples.len() < MIN_SUCCESSFUL_PROBES {
         return None;
     }
 
@@ -361,7 +185,7 @@ async fn measure_validator_rtt(
     let p95_idx = ((samples.len() as f64 * 0.95) as usize).min(samples.len() - 1);
     let p95 = samples[p95_idx];
 
-    Some((min, avg, p95, resolved_ip, protocol))
+    Some((min, avg, p95, resolved_ip))
 }
 
 /* ================== Validator Data ================== */
@@ -378,7 +202,6 @@ struct ValidatorRtt {
     avg_rtt: u128,
     p95_rtt: u128,
     score: f64,
-    protocol: String,
 }
 
 impl ValidatorRtt {
@@ -450,18 +273,18 @@ fn print_header() {
 }
 
 fn print_top_validators(validators: &[ValidatorRtt], n: usize) {
-    println!("┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐");
-    println!("│                                    TOP {} LOWEST LATENCY VALIDATORS                                                  │", n);
-    println!("├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤");
+    println!("┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐");
+    println!("│                                    TOP {} LOWEST LATENCY VALIDATORS                                     │", n);
+    println!("├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤");
     println!(
-        "│ {:>4} │ {:<24} │ {:<21} │ {:>5} │ {:>5} │ {:>5} │ {:>6} │ {:>6} │ {:>4} │",
-        "Rank", "Name", "IP:Port", "Min", "Avg", "P95", "Stake%", "Region", "Proto"
+        "│ {:>4} │ {:<24} │ {:<21} │ {:>5} │ {:>5} │ {:>5} │ {:>6} │ {:>6} │",
+        "Rank", "Name", "IP:Port", "Min", "Avg", "P95", "Stake%", "Region"
     );
-    println!("├──────┼──────────────────────────┼───────────────────────┼───────┼───────┼───────┼────────┼────────┼──────┤");
+    println!("├──────┼──────────────────────────┼───────────────────────┼───────┼───────┼───────┼────────┼────────┤");
 
     for (i, v) in validators.iter().take(n).enumerate() {
         println!(
-            "│ {:>4} │ {:<24} │ {:>21} │ {:>4}ms │ {:>4}ms │ {:>4}ms │ {:>5.2}% │ {:>6} │ {:>4} │",
+            "│ {:>4} │ {:<24} │ {:>21} │ {:>4}ms │ {:>4}ms │ {:>4}ms │ {:>5.2}% │ {:>6} │",
             i + 1,
             truncate_str(&v.name, 24),
             format!("{}:{}", v.ip, v.port),
@@ -469,11 +292,10 @@ fn print_top_validators(validators: &[ValidatorRtt], n: usize) {
             v.avg_rtt,
             v.p95_rtt,
             v.stake_pct,
-            v.region,
-            v.protocol
+            v.region
         );
     }
-    println!("└──────┴──────────────────────────┴───────────────────────┴───────┴───────┴───────┴────────┴────────┴──────┘");
+    println!("└──────┴──────────────────────────┴───────────────────────┴───────┴───────┴───────┴────────┴────────┘");
 }
 
 fn print_region_summary(region_stats: &HashMap<String, RegionStats>, total_stake: u64) {
@@ -511,18 +333,18 @@ fn print_stake_weighted_top(validators: &[ValidatorRtt], n: usize) {
     by_score.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
 
     println!();
-    println!("┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐");
-    println!("│                              TOP {} BY STAKE-WEIGHTED SCORE (Lower = Better)                                         │", n);
-    println!("├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤");
+    println!("┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐");
+    println!("│                              TOP {} BY STAKE-WEIGHTED SCORE (Lower = Better)                            │", n);
+    println!("├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤");
     println!(
-        "│ {:>4} │ {:<24} │ {:>5} │ {:>5} │ {:>5} │ {:>6} │ {:>9} │ {:>6} │ {:>4} │",
-        "Rank", "Name", "Min", "Avg", "P95", "Stake%", "Score", "Region", "Proto"
+        "│ {:>4} │ {:<24} │ {:>5} │ {:>5} │ {:>5} │ {:>6} │ {:>9} │ {:>6} │",
+        "Rank", "Name", "Min", "Avg", "P95", "Stake%", "Score", "Region"
     );
-    println!("├──────┼──────────────────────────┼───────┼───────┼───────┼────────┼───────────┼────────┼──────┤");
+    println!("├──────┼──────────────────────────┼───────┼───────┼───────┼────────┼───────────┼────────┤");
 
     for (i, v) in by_score.iter().take(n).enumerate() {
         println!(
-            "│ {:>4} │ {:<24} │ {:>4}ms │ {:>4}ms │ {:>4}ms │ {:>5.2}% │ {:>9.1} │ {:>6} │ {:>4} │",
+            "│ {:>4} │ {:<24} │ {:>4}ms │ {:>4}ms │ {:>4}ms │ {:>5.2}% │ {:>9.1} │ {:>6} │",
             i + 1,
             truncate_str(&v.name, 24),
             v.min_rtt,
@@ -530,11 +352,10 @@ fn print_stake_weighted_top(validators: &[ValidatorRtt], n: usize) {
             v.p95_rtt,
             v.stake_pct,
             v.score,
-            v.region,
-            v.protocol
+            v.region
         );
     }
-    println!("└──────┴──────────────────────────┴───────┴───────┴───────┴────────┴───────────┴────────┴──────┘");
+    println!("└──────┴──────────────────────────┴───────┴───────┴───────┴────────┴───────────┴────────┘");
 }
 
 /* ================== Main ================== */
@@ -551,7 +372,7 @@ async fn main() -> Result<()> {
     let total_stake: u64 = validators.iter().map(|v| v.voting_power).sum();
 
     println!("✓ Found {} active validators (Total stake: {})", validators.len(), total_stake);
-    println!("⏳ Probing QUIC RTT with {} concurrent connections...\n", MAX_CONCURRENT_PROBES);
+    println!("⏳ Probing TCP RTT with {} concurrent connections...\n", MAX_CONCURRENT_PROBES);
 
     // Semaphore for concurrency control
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PROBES));
@@ -561,13 +382,11 @@ async fn main() -> Result<()> {
     let mut validator_info: Vec<(String, u64, String, u16, String)> = Vec::new();
 
     // Debug: show first few addresses
-    if DEBUG {
-        println!("Sample addresses:");
-        for v in validators.iter().take(3) {
-            println!("  {} -> {}", v.name, v.p2p_address);
-        }
-        println!();
+    println!("Sample addresses:");
+    for v in validators.iter().take(3) {
+        println!("  {} -> {}", v.name, v.p2p_address);
     }
+    println!();
 
     for v in &validators {
         if let Some((host, port, domain)) = parse_multiaddr(&v.p2p_address) {
@@ -593,25 +412,13 @@ async fn main() -> Result<()> {
     let mut validator_rtts: Vec<ValidatorRtt> = Vec::new();
     let mut success_count = 0;
     let mut fail_count = 0;
-    let mut quic_count = 0;
-    let mut tcp_count = 0;
 
     for (i, rtt_result) in results.into_iter().enumerate() {
         let (name, stake, region, port, _host) = &validator_info[i];
 
         match rtt_result {
-            Some((min, avg, p95, ip, proto)) => {
+            Some((min, avg, p95, ip)) => {
                 success_count += 1;
-                let protocol_str = match proto {
-                    ProbeProtocol::Quic => {
-                        quic_count += 1;
-                        "QUIC"
-                    }
-                    ProbeProtocol::Tcp => {
-                        tcp_count += 1;
-                        "TCP"
-                    }
-                };
                 let mut v = ValidatorRtt {
                     name: name.clone(),
                     ip,
@@ -623,7 +430,6 @@ async fn main() -> Result<()> {
                     avg_rtt: avg,
                     p95_rtt: p95,
                     score: 0.0,
-                    protocol: protocol_str.to_string(),
                 };
                 v.calculate_score(total_stake);
                 validator_rtts.push(v);
@@ -634,8 +440,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    println!("✓ Probed {} validators successfully ({} QUIC, {} TCP), {} failed\n", 
-             success_count, quic_count, tcp_count, fail_count);
+    println!("✓ Probed {} validators successfully, {} failed\n", success_count, fail_count);
 
     // Sort by average RTT for top display
     validator_rtts.sort_by_key(|v| v.avg_rtt);
