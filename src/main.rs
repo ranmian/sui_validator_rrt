@@ -1,11 +1,11 @@
 //! Sui Validator RTT Probe - Industrial Grade
 //!
-//! Measures RTT to Sui validators using TCP connection timing.
-//! QUIC/Anemo requires mutual TLS with validator certificates,
-//! so we use TCP handshake RTT as a reliable proxy for network latency.
+//! Measures RTT to Sui validators using ICMP ping.
+//! Validators use UDP for QUIC/Anemo P2P, so TCP probes won't work.
+//! ICMP ping provides accurate network latency measurement.
 //!
 //! Features:
-//! - TCP handshake RTT measurement (reliable, no cert issues)
+//! - ICMP ping RTT measurement (works with any host)
 //! - Concurrency control with semaphore
 //! - Stake-weighted ranking and scoring
 //! - DNS resolution support
@@ -15,11 +15,11 @@ use anyhow::Result;
 use futures::future::join_all;
 use std::{
     collections::HashMap,
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
+    process::Stdio,
     sync::Arc,
-    time::{Duration, Instant},
 };
-use tokio::{net::TcpStream, sync::Semaphore, time::timeout};
+use tokio::{process::Command, sync::Semaphore};
 
 use sui_sdk::SuiClientBuilder;
 
@@ -31,17 +31,11 @@ const RPC_URL: &str = "https://fullnode.mainnet.sui.io";
 /// Default port for Sui P2P
 const DEFAULT_PORT: u16 = 8084;
 
-/// Number of RTT probes per validator
+/// Number of ping probes per validator
 const RTT_PROBES: usize = 5;
 
-/// Timeout for each probe attempt (ms)
-const RTT_TIMEOUT_MS: u64 = 3000;
-
-/// Maximum concurrent connections
-const MAX_CONCURRENT_PROBES: usize = 100;
-
-/// Delay between probes to same validator (ms)
-const PROBE_INTERVAL_MS: u64 = 50;
+/// Maximum concurrent ping processes
+const MAX_CONCURRENT_PROBES: usize = 50;
 
 /// Number of top validators to display
 const TOP_N_VALIDATORS: usize = 30;
@@ -138,52 +132,81 @@ fn infer_region(name: &str, domain: &str) -> &'static str {
 
 /* ================== RTT Measurement ================== */
 
-/// Measure TCP handshake RTT (SYN -> SYN-ACK timing)
-async fn probe_tcp_rtt(addr: SocketAddr) -> Option<u128> {
-    let start = Instant::now();
-    match timeout(Duration::from_millis(RTT_TIMEOUT_MS), TcpStream::connect(addr)).await {
-        Ok(Ok(_stream)) => Some(start.elapsed().as_millis()),
-        _ => None,
+/// Parse ping output to extract RTT values (macOS/Linux compatible)
+fn parse_ping_output(output: &str) -> Option<Vec<f64>> {
+    let mut rtts = Vec::new();
+    
+    for line in output.lines() {
+        // macOS/Linux: "64 bytes from ...: icmp_seq=0 ttl=52 time=12.345 ms"
+        if line.contains("time=") {
+            if let Some(time_part) = line.split("time=").nth(1) {
+                let time_str = time_part.split_whitespace().next()?;
+                let time_str = time_str.trim_end_matches("ms").trim();
+                if let Ok(ms) = time_str.parse::<f64>() {
+                    rtts.push(ms);
+                }
+            }
+        }
+    }
+    
+    if rtts.is_empty() {
+        None
+    } else {
+        Some(rtts)
     }
 }
 
-/// Measure RTT with multiple TCP probes
+/// Measure RTT using ICMP ping (system command)
 async fn measure_validator_rtt(
     host: String,
-    port: u16,
+    _port: u16,
     semaphore: Arc<Semaphore>,
+    probe_count: usize,
 ) -> Option<(u128, u128, u128, IpAddr)> {
     // Acquire semaphore permit for concurrency control
     let _permit = semaphore.acquire().await.ok()?;
 
-    // Resolve DNS
-    let addr_str = format!("{}:{}", host, port);
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&addr_str).await.ok()?.collect();
-    let addr = *addrs.first()?;
-    let resolved_ip = addr.ip();
+    // Resolve DNS first to get the IP
+    let addr_str = format!("{}:0", host);
+    let addrs: Vec<_> = tokio::net::lookup_host(&addr_str).await.ok()?.collect();
+    let resolved_ip = addrs.first()?.ip();
 
-    let mut samples: Vec<u128> = Vec::with_capacity(RTT_PROBES);
+    // Use ping command (works without root on most systems)
+    // macOS: ping -c COUNT -W TIMEOUT_MS
+    // Linux: ping -c COUNT -W TIMEOUT_SEC
+    #[cfg(target_os = "macos")]
+    let output = Command::new("ping")
+        .args(["-c", &probe_count.to_string(), "-W", "3000", &host])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
 
-    for probe_idx in 0..RTT_PROBES {
-        if probe_idx > 0 {
-            tokio::time::sleep(Duration::from_millis(PROBE_INTERVAL_MS)).await;
-        }
-        if let Some(rtt) = probe_tcp_rtt(addr).await {
-            samples.push(rtt);
-        }
-    }
+    #[cfg(not(target_os = "macos"))]
+    let output = Command::new("ping")
+        .args(["-c", &probe_count.to_string(), "-W", "3", &host])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let samples = parse_ping_output(&stdout)?;
 
     // Need minimum samples for statistics
     if samples.len() < MIN_SUCCESSFUL_PROBES {
         return None;
     }
 
-    samples.sort();
+    let mut sorted_samples = samples.clone();
+    sorted_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-    let min = samples[0];
-    let avg = samples.iter().sum::<u128>() / samples.len() as u128;
-    let p95_idx = ((samples.len() as f64 * 0.95) as usize).min(samples.len() - 1);
-    let p95 = samples[p95_idx];
+    let min = sorted_samples[0] as u128;
+    let avg = (samples.iter().sum::<f64>() / samples.len() as f64) as u128;
+    let p95_idx = ((sorted_samples.len() as f64 * 0.95) as usize).min(sorted_samples.len() - 1);
+    let p95 = sorted_samples[p95_idx] as u128;
 
     Some((min, avg, p95, resolved_ip))
 }
@@ -267,7 +290,7 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 fn print_header() {
     println!();
     println!("╔══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗");
-    println!("║                              SUI VALIDATOR RTT PROBE - QUIC/Anemo Layer                                          ║");
+    println!("║                              SUI VALIDATOR RTT PROBE - ICMP Ping                                                 ║");
     println!("╚══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝");
     println!();
 }
@@ -372,7 +395,7 @@ async fn main() -> Result<()> {
     let total_stake: u64 = validators.iter().map(|v| v.voting_power).sum();
 
     println!("✓ Found {} active validators (Total stake: {})", validators.len(), total_stake);
-    println!("⏳ Probing TCP RTT with {} concurrent connections...\n", MAX_CONCURRENT_PROBES);
+    println!("⏳ Probing RTT with ICMP ping ({} concurrent, {} probes each)...\n", MAX_CONCURRENT_PROBES, RTT_PROBES);
 
     // Semaphore for concurrency control
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PROBES));
@@ -401,7 +424,7 @@ async fn main() -> Result<()> {
                 host.clone(),
             ));
 
-            tasks.push(measure_validator_rtt(host, port, sem));
+            tasks.push(measure_validator_rtt(host, port, sem, RTT_PROBES));
         }
     }
 
