@@ -79,55 +79,120 @@ fn parse_multiaddr(addr: &str) -> Option<(String, u16, String)> {
 /* ================== Region Inference ================== */
 
 /// Infer geographic region from validator name and domain
-fn infer_region(name: &str, domain: &str) -> &'static str {
+/// Returns a tuple: (region_code, is_inferred)
+fn infer_region(name: &str, domain: &str) -> String {
     let s = format!("{} {}", name.to_lowercase(), domain);
 
     // Asia Pacific
     if s.contains("sg") || s.contains("singapore") {
-        return "SG";
+        return "SG".to_string();
     }
-    if s.contains("jp") || s.contains("tokyo") || s.contains("japan") {
-        return "JP";
+    if s.contains("jp") || s.contains("tokyo") || s.contains("japan") || s.contains("tyo") {
+        return "JP".to_string();
     }
     if s.contains("hk") || s.contains("hongkong") || s.contains("hong kong") {
-        return "HK";
+        return "HK".to_string();
     }
-    if s.contains("kr") || s.contains("korea") || s.contains("seoul") {
-        return "KR";
+    if s.contains("kr") || s.contains("korea") || s.contains("seoul") || s.contains("icn") {
+        return "KR".to_string();
     }
-    if s.contains("tw") || s.contains("taiwan") {
-        return "TW";
+    if s.contains("tw") || s.contains("taiwan") || s.contains("taipei") {
+        return "TW".to_string();
     }
-    if s.contains("au") || s.contains("sydney") || s.contains("australia") {
-        return "AU";
+    if s.contains("au") || s.contains("sydney") || s.contains("australia") || s.contains("syd") {
+        return "AU".to_string();
+    }
+    if s.contains("in") && (s.contains("mumbai") || s.contains("india") || s.contains("bom")) {
+        return "IN".to_string();
     }
 
     // Europe
     if s.contains("de") || s.contains("fra") || s.contains("frankfurt") || s.contains("germany") {
-        return "EU-DE";
+        return "EU-DE".to_string();
     }
-    if s.contains("nl") || s.contains("ams") || s.contains("amsterdam") {
-        return "EU-NL";
+    if s.contains("nl") || s.contains("ams") || s.contains("amsterdam") || s.contains("netherlands") {
+        return "EU-NL".to_string();
     }
-    if s.contains("uk") || s.contains("london") {
-        return "EU-UK";
+    if s.contains("uk") || s.contains("london") || s.contains("lhr") || s.contains("britain") {
+        return "EU-UK".to_string();
     }
-    if s.contains("fi") || s.contains("helsinki") {
-        return "EU-FI";
+    if s.contains("fi") || s.contains("helsinki") || s.contains("finland") {
+        return "EU-FI".to_string();
+    }
+    if s.contains("fr") || s.contains("paris") || s.contains("france") || s.contains("cdg") {
+        return "EU-FR".to_string();
+    }
+    if s.contains("ie") || s.contains("dublin") || s.contains("ireland") {
+        return "EU-IE".to_string();
+    }
+    if s.contains("ch") || s.contains("zurich") || s.contains("switzerland") {
+        return "EU-CH".to_string();
+    }
+    if s.contains("pl") || s.contains("warsaw") || s.contains("poland") {
+        return "EU-PL".to_string();
     }
 
     // Americas
-    if s.contains("us-east") || s.contains("virginia") || s.contains("nyc") || s.contains("new york") {
-        return "US-E";
+    if s.contains("us-east") || s.contains("virginia") || s.contains("nyc") 
+        || s.contains("new york") || s.contains("iad") || s.contains("ewr") || s.contains("ashburn") {
+        return "US-E".to_string();
     }
-    if s.contains("us-west") || s.contains("california") || s.contains("sfo") || s.contains("lax") {
-        return "US-W";
+    if s.contains("us-west") || s.contains("california") || s.contains("sfo") 
+        || s.contains("lax") || s.contains("sjc") || s.contains("pdx") || s.contains("sea") {
+        return "US-W".to_string();
     }
-    if s.contains("us") {
-        return "US";
+    if s.contains("us-central") || s.contains("chicago") || s.contains("ord") || s.contains("dallas") || s.contains("dfw") {
+        return "US-C".to_string();
+    }
+    if s.contains("us") || s.contains("america") {
+        return "US".to_string();
+    }
+    if s.contains("ca") && (s.contains("canada") || s.contains("toronto") || s.contains("montreal")) {
+        return "CA".to_string();
+    }
+    if s.contains("br") || s.contains("brazil") || s.contains("sao paulo") || s.contains("gru") {
+        return "BR".to_string();
     }
 
-    "OTHER"
+    // Cloud provider regions (common patterns)
+    if s.contains("aws") || s.contains("ec2") {
+        // Try to extract AWS region
+        if s.contains("ap-") { return "APAC".to_string(); }
+        if s.contains("eu-") { return "EU".to_string(); }
+        if s.contains("us-") { return "US".to_string(); }
+    }
+    if s.contains("gcp") || s.contains("gcloud") {
+        if s.contains("asia") { return "APAC".to_string(); }
+        if s.contains("europe") { return "EU".to_string(); }
+        if s.contains("america") { return "US".to_string(); }
+    }
+
+    // If we can't identify, extract a hint from the domain
+    // e.g., "validator.mycompany.io" -> "MYCOMP"
+    if !domain.is_empty() {
+        let parts: Vec<&str> = domain.split('.').collect();
+        if parts.len() >= 2 {
+            let hint = parts[0].to_uppercase();
+            if hint.len() <= 8 {
+                return format!("?{}", hint);  // ? prefix indicates unknown
+            } else {
+                return format!("?{}...", &hint[..5]);
+            }
+        }
+    }
+
+    // Last resort: use validator name prefix
+    let name_hint: String = name.chars()
+        .filter(|c| c.is_alphanumeric())
+        .take(6)
+        .collect::<String>()
+        .to_uppercase();
+    
+    if !name_hint.is_empty() {
+        format!("?{}", name_hint)
+    } else {
+        "?".to_string()
+    }
 }
 
 /* ================== RTT Measurement ================== */
@@ -413,7 +478,7 @@ async fn main() -> Result<()> {
 
     for v in &validators {
         if let Some((host, port, domain)) = parse_multiaddr(&v.p2p_address) {
-            let region = infer_region(&v.name, &domain).to_string();
+            let region = infer_region(&v.name, &domain);
             let sem = Arc::clone(&semaphore);
 
             validator_info.push((
