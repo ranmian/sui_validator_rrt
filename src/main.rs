@@ -168,30 +168,56 @@ fn infer_region(name: &str, domain: &str) -> String {
     }
 
     // If we can't identify, extract a hint from the domain
-    // e.g., "validator.mycompany.io" -> "MYCOMP"
+    // Skip common meaningless prefixes like "sui", "validator", "mainnet", etc.
     if !domain.is_empty() {
+        let meaningless = ["sui", "validator", "mainnet", "testnet", "node", "rpc", 
+                          "api", "server", "prod", "main", "val", "staking"];
+        
         let parts: Vec<&str> = domain.split('.').collect();
-        if parts.len() >= 2 {
-            let hint = parts[0].to_uppercase();
+        
+        // Try to find a meaningful part in the domain
+        for part in &parts {
+            let lower = part.to_lowercase();
+            // Skip if it's a meaningless prefix or TLD
+            if meaningless.iter().any(|m| lower.contains(m)) {
+                continue;
+            }
+            if ["com", "io", "net", "org", "xyz", "dev", "co", "app"].contains(&lower.as_str()) {
+                continue;
+            }
+            // Skip if too short (like country codes in domain)
+            if part.len() < 3 {
+                continue;
+            }
+            // Found a meaningful part
+            let hint = part.to_uppercase();
             if hint.len() <= 8 {
-                return format!("?{}", hint);  // ? prefix indicates unknown
+                return format!("?{}", hint);
             } else {
-                return format!("?{}...", &hint[..5]);
+                return format!("?{}...", &hint[..6]);
+            }
+        }
+        
+        // Fallback: use the main domain part (usually 2nd level)
+        if parts.len() >= 2 {
+            let main_domain = parts[parts.len() - 2].to_uppercase();
+            if main_domain.len() <= 8 {
+                return format!("?{}", main_domain);
+            } else {
+                return format!("?{}...", &main_domain[..6]);
             }
         }
     }
 
-    // Last resort: use validator name prefix
-    let name_hint: String = name.chars()
-        .filter(|c| c.is_alphanumeric())
-        .take(6)
-        .collect::<String>()
-        .to_uppercase();
+    // Last resort: use validator name (cleaned up)
+    let clean_name: String = name.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-')
+        .collect();
     
-    if !name_hint.is_empty() {
-        format!("?{}", name_hint)
+    if clean_name.len() <= 8 {
+        format!("?{}", clean_name)
     } else {
-        "?".to_string()
+        format!("?{}...", &clean_name[..6])
     }
 }
 
