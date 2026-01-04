@@ -42,6 +42,7 @@ async fn main() -> Result<()> {
         if let Some(checkpoint) = message.checkpoint {
             println!("Received checkpoint: {:?}", checkpoint.sequence_number());
             let summary = checkpoint.summary();
+            println!("{:?}", summary);
 
             // 打印时间差
             if let Some(ts) = summary.timestamp {
