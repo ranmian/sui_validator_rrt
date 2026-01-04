@@ -40,8 +40,8 @@ async fn main() -> Result<()> {
 
     while let Some(message) = response.message().await? {
         if let Some(checkpoint) = message.checkpoint {
-            println!("Received checkpoint: {:?}", checkpoint.sequence_number());
-            let summary = checkpoint.summary();
+            println!("Received checkpoint: {:?} - {:?}", checkpoint.sequence_number(), tokio::time::Instant::now());
+            let summary: &sui_rpc::proto::sui::rpc::v2::CheckpointSummary = checkpoint.summary();
             // println!("{:?}", summary);
 
             // 打印时间差
