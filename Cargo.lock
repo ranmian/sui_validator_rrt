@@ -1172,6 +1172,7 @@ name = "checkpoint"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "sui-rpc 0.1.0",
  "sui-sdk-types 0.1.0",
  "tokio",

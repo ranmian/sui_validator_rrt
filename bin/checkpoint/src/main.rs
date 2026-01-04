@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use chrono::Local;
 use sui_rpc::proto::sui::rpc::v2::{
     SubscribeCheckpointsRequest, subscription_service_client::SubscriptionServiceClient,
 };
@@ -40,7 +41,8 @@ async fn main() -> Result<()> {
 
     while let Some(message) = response.message().await? {
         if let Some(checkpoint) = message.checkpoint {
-            println!("Received checkpoint: {:?} - {:?}", checkpoint.sequence_number(), tokio::time::Instant::now());
+            let now = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+            println!("Received checkpoint: {:?} - {}", checkpoint.sequence_number(), now);
             let summary: &sui_rpc::proto::sui::rpc::v2::CheckpointSummary = checkpoint.summary();
             // println!("{:?}", summary);
 
