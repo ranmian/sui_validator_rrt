@@ -8,3 +8,12 @@ futures = "0.3"
 tokio = { version = "1", features = ["full"] }
 
 sui-sdk = { git = "https://github.com/MystenLabs/sui", package = "sui-sdk" }
+
+sui-sdk-types = { git = "https://github.com/MystenLabs/sui-rust-sdk.git", rev = "fca0ea3a409a71f9be5235711d706507d8d390f3", features = [ "hash", "serde" ] }
+sui-rpc = { git = "https://github.com/MystenLabs/sui-rust-sdk.git", rev = "fca0ea3a409a71f9be5235711d706507d8d390f3" }
+
+tonic = { version = "0.14.2", features = [
+  "zstd",
+  "transport",
+  "tls-webpki-roots",
+] }
